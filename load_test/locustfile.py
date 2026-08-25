@@ -20,7 +20,7 @@ class SteadyUser(HttpUser):
     wait_time = between(0.5, 1.5)
 
     def on_start(self):
-        self.api_key = f"steady-{random.randint(1, 500)}"
+        self.api_key = f"steady-{random.randint(1, 5000)}"
 
     @task
     def call_gateway(self):
