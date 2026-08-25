@@ -6,9 +6,10 @@ A distributed rate limiter and API gateway in FastAPI, with rate-limit
 state shared across multiple gateway instances via Redis — so scaling the
 gateway horizontally doesn't let clients bypass their limit by hitting a
 different instance. Implements Token Bucket, Sliding Window Log, and
-Sliding Window Counter algorithms as atomic Redis Lua scripts, and is
-stress-tested up to 50,000 concurrent requests and 1,000 simultaneous
-clients with the limit holding exactly every time (see [Tests](#tests)).
+Sliding Window Counter algorithms as atomic Redis Lua scripts. Stress-tested
+up to 50,000 concurrent requests and 1,000 simultaneous clients with the
+limit holding exactly every time, and characterized to a sustained ~32,000
+checks/sec ceiling set by the connection pool (see [Tests](#tests)).
 
 ## Architecture
 
@@ -88,10 +89,9 @@ alembic upgrade head
 pytest -v
 ```
 
-**30 tests, all passing against real Redis + Postgres + the actual FastAPI
-app (no mocks), reproduced flake-free across 5+ consecutive full-suite runs
-(30/30 every time).** A GitHub Actions workflow (`.github/workflows/ci.yml`)
-runs the same suite against Postgres/Redis service containers on every push.
+30 tests, run against real Redis and Postgres and the actual FastAPI app
+(no mocks). A GitHub Actions workflow (`.github/workflows/ci.yml`) runs the
+suite against Postgres/Redis service containers on every push.
 
 | File | Count | What it proves |
 |---|---|---|
@@ -103,14 +103,17 @@ runs the same suite against Postgres/Redis service containers on every push.
 | `test_gateway_integration.py` | 6 | End-to-end through the real ASGI app: proxy → upstream forwarding, 429 + `Retry-After` once over limit, admin config CRUD with immediate cache invalidation, rejected unknown algorithms, denied requests appearing in the audit log |
 | `test_dependencies.py` | 3 | Config resolution falls back to defaults, picks up a Postgres override, and is correctly served from the Redis cache rather than hitting Postgres every request |
 
-### Test results (for resume / portfolio)
+### Benchmark results
+
+Full suite:
 
 ```
 30 passed in 13.75s
 ```
 
-The concurrency + stress suite, run standalone with `-s` to show the numbers —
-including the two headline large-scale runs:
+Concurrency and stress suite (`pytest -s tests/test_concurrency_stress.py`),
+each case firing requests via `asyncio.gather` for true concurrency rather
+than sequential awaits:
 
 ```
 [TokenBucketLimiter] 2500 concurrent requests, limit=50: 50 allowed, 0.156s wall clock (15997 checks/sec)
@@ -124,39 +127,88 @@ including the two headline large-scale runs:
 [MASSIVE] 1000 clients x 20 concurrent requests (20000 total): every client admitted exactly 10, 1.375s wall clock (14547 checks/sec)
 ```
 
-Ran the full stress suite 3x back-to-back with **zero flakiness** — every run,
-every scale (2,500 up through 50,000 concurrent requests), the limit held
-*exactly*, and every one of the 1,000 simultaneous clients in the isolation
-test was admitted *exactly* its own limit, no more, no less.
+The limit held exactly at every scale tested, from 2,500 up through 50,000
+concurrent requests on a single key, and every one of the 1,000 simultaneous
+clients in the isolation test was admitted exactly its own configured limit.
+Repeated across multiple runs with no variance.
 
-Why this matters more than "tests pass": a naive Python `GET count; if count < limit: INCR`
-implementation would let concurrent requests race — two coroutines can both read
-`count=19` before either writes back, letting both through and breaking the limit.
-These tests fire requests concurrently on purpose to try to trigger exactly that bug,
-at up to 100x oversubscription, 50,000 requests deep, and across 1,000 simultaneous
-clients, and confirm Redis's atomic Lua execution prevents it every time.
+A naive `GET count; if count < limit: INCR` implementation in application
+code would race under concurrency — two coroutines can both read `count=19`
+before either writes back, letting both through and breaking the limit.
+These tests fire requests concurrently specifically to trigger that failure
+mode, and confirm Redis's atomic Lua script execution prevents it at every
+concurrency level tested.
 
-### Two real bugs this testing effort caught
+### Design notes
 
-Writing these tests didn't just confirm the design — it found actual bugs, which
-is a better interview story than "I wrote tests and they passed":
+Two issues surfaced during stress testing and were fixed:
 
-1. **Stale limiter cache.** `get_limiter()` cached each algorithm's Lua-script
-   wrapper keyed only by algorithm name, permanently binding it to whichever
-   Redis client was passed on the *first* call. If the app ever reconnects to
-   Redis (a new client instance), old cached limiters keep talking to the dead
-   connection. Fixed by keying the cache on `(algorithm, id(redis))` instead —
-   see `app/algorithms/__init__.py`.
-2. **Unbounded connection pool under bursty load.** The Redis client had no
-   `max_connections` cap, so firing thousands of truly concurrent requests
-   (via `asyncio.gather` in the stress tests) made it open one new TCP
-   connection per in-flight request instead of reusing a small pool — thousands
-   of connections at once, which measurably degraded Redis and, at higher
-   concurrency, stalled outright. Fixed with a bounded `BlockingConnectionPool`
-   (`max_connections=50`, callers queue instead of erroring) — which also
-   turned out ~3x *faster* in practice (2500 concurrent checks: ~5.5k
-   checks/sec unbounded vs. ~16k checks/sec bounded), since reusing 50 warm
-   connections beats a fresh TCP handshake per request.
+1. **Limiter cache keyed by algorithm only.** `get_limiter()` originally
+   cached each algorithm's Lua-script wrapper keyed on algorithm name alone,
+   permanently binding it to whichever Redis client instance was passed on
+   the first call. A reconnect (a new client instance) would leave cached
+   limiters pointing at a dead connection. Fixed by keying the cache on
+   `(algorithm, id(redis))` — see `app/algorithms/__init__.py`.
+2. **Unbounded Redis connection pool.** The Redis client had no
+   `max_connections` cap, so a burst of concurrent requests opened one new
+   TCP connection per in-flight request rather than reusing a bounded pool —
+   thousands of connections under the stress tests' concurrency, which
+   degraded throughput measurably. Fixed with a `BlockingConnectionPool`
+   (`max_connections=50`, callers queue for a free connection instead of
+   erroring). Effect on the 2,500-concurrent-request case: ~5,500 checks/sec
+   unbounded vs. ~16,000 checks/sec bounded — reusing warm connections
+   outperforms a fresh TCP handshake per request.
+
+### Scalability characterization
+
+`scripts/benchmark_scaling.py` measures raw throughput of the rate-limit
+check path (distinct keys per request, so no client's own limit throttles
+the result) across a range of concurrency levels, plus a sustained-load
+run to distinguish burst performance from steady-state performance:
+
+```bash
+PYTHONPATH=. python scripts/benchmark_scaling.py
+```
+
+```
+Bounded pool: max_connections=50
+
+ Concurrency | Wall clock |      Throughput
+---------------------------------------------
+         100 |     0.011s |        9,032/s
+         500 |     0.025s |       20,079/s
+       1,000 |     0.052s |       19,257/s
+       5,000 |     0.289s |       17,289/s
+      10,000 |     0.579s |       17,258/s
+      25,000 |     1.686s |       14,830/s
+      50,000 |     3.578s |       13,974/s
+     100,000 |     7.350s |       13,606/s
+
+Sustained load: 200 concurrent workers, 10s continuous (not a single burst)
+Total operations: 312,228
+Sustained throughput: 31,197 checks/sec
+```
+
+Single-burst throughput peaks around 500-5,000 concurrent requests
+(~18,000-20,000/s) and declines as `asyncio.gather` is asked to schedule
+tens of thousands of coroutines at once — that decline is Python-side
+scheduling overhead, not Redis. A sustained worker-pool pattern (a fixed
+number of workers issuing requests continuously for 10 seconds, rather
+than one giant burst) avoids that overhead and sustains higher throughput:
+
+```
+workers=  50  total_ops=272,740  throughput=    34,090/s
+workers= 100  total_ops=258,246  throughput=    32,269/s
+workers= 200  total_ops=259,251  throughput=    32,373/s
+workers= 400  total_ops=262,034  throughput=    32,678/s
+workers= 800  total_ops=249,577  throughput=    31,046/s
+```
+
+Sustained throughput plateaus at 31,000-34,000 checks/sec regardless of
+worker count from 50 to 800, which identifies the actual limiting resource:
+the 50-connection bounded pool, not application-level concurrency. Raising
+`redis_max_connections` (`app/config.py`) would be the next lever to pull
+for higher sustained throughput.
 
 ## Load testing
 
@@ -171,9 +223,9 @@ locust -f load_test/locustfile.py --host http://localhost:8080
 locust -f load_test/locustfile.py SteadyUser --host http://localhost:8080 --headless -u 1000 -r 100 --run-time 45s
 ```
 
-All numbers below are from the full Docker Compose stack (3 gateway
-replicas + nginx + Redis + Postgres + Locust) on a single M-series laptop —
-everything, including the load generator, sharing one machine's cores.
+Numbers below are from the full Docker Compose stack (3 gateway replicas +
+nginx + Redis + Postgres + Locust) on a single M-series laptop, with the
+load generator sharing the same machine's cores as the system under test.
 
 **500 concurrent users, 45s, legitimate traffic (`SteadyUser`):**
 
@@ -183,8 +235,7 @@ everything, including the load generator, sharing one machine's cores.
 p50: 3ms   p95: 15ms   p99: 170ms   max: 240ms
 ```
 
-**1000 concurrent users, 45s, legitimate traffic:** throughput plateaus
-rather than scaling further — this is where I found the actual bottleneck:
+**1000 concurrent users, 45s, legitimate traffic:**
 
 ```
 23449 requests, 1 failure (0.00%)
@@ -192,9 +243,10 @@ rather than scaling further — this is where I found the actual bottleneck:
 p50: 100ms   p95: 200ms   p99: 260ms   max: 424ms
 ```
 
-Latency at 1000 users is ~30x higher than at 500 despite less than 2x the
-throughput gain, so I checked `docker stats` mid-run instead of just
-reporting the number:
+Throughput plateaus rather than scaling linearly between the two runs, and
+latency at 1000 users is roughly 30x higher than at 500 for less than 2x
+the throughput gain. `docker stats` during the 1000-user run identifies
+the bottleneck:
 
 ```
 gateway1   106% CPU   68MiB
@@ -206,103 +258,22 @@ nginx       19% CPU   25MiB
 redis       10% CPU   20MiB
 ```
 
-All 3 gateway containers are CPU-saturated (single uvicorn worker each,
-no multiprocessing) and Postgres is at 78% — the synchronous audit-log
-`INSERT` + commit on every request (`_log_audit`, via `BackgroundTasks`)
-is real load, not free. Redis, the thing actually doing the atomic
-rate-limit math, is barely touched at 10%. **The bottleneck at this scale
-is the app tier and the audit log, not the rate limiter** — the correct
-next steps would be more uvicorn workers per gateway, batching the audit
-log writes, or both. That diagnosis is worth more in an interview than the
-raw req/s number.
+All three gateway containers are CPU-saturated (single uvicorn worker each,
+no multiprocessing), and Postgres is at 78% CPU from the synchronous
+audit-log insert issued on every request (`_log_audit`, via
+`BackgroundTasks`). Redis — the component doing the actual rate-limit
+math — is at 10%. At this scale the bottleneck is the application tier and
+audit logging, not the rate limiter; addressing it would mean running
+multiple uvicorn workers per gateway process, batching the audit-log
+writes, or both.
 
-**300 concurrent users, all over their limit, 30s (`BurstyUser`):** the
-*rejection* path is cheap — no upstream call, so it actually sustains
-higher throughput than the accept path:
+**300 concurrent users, all over their configured limit, 30s
+(`BurstyUser`):** the rejection path skips the upstream call, so it
+sustains higher throughput than the accept path:
 
 ```
-45132 requests, 44735 rejected with 429 (99.12% — as designed, these
-clients share only 5 API keys on purpose to force over-limit traffic)
+45132 requests, 44735 rejected with 429 (99.12% — by design, these
+clients share only 5 API keys to force over-limit traffic)
 1509 req/s sustained
 p50: 170ms   p99: 250ms
 ```
-
-## Resume bullet points
-
-Measured on a single M-series laptop running the full Docker Compose stack
-(3 gateway replicas + nginx + Redis + Postgres) — a dedicated host would do
-meaningfully better; re-run `make load-test` and swap in your own numbers.
-
-### Copy-paste block (use these 4)
-
-Leads with the *debugging story*, not the test count — "found and fixed a
-real bug" reads stronger than "wrote N tests" to an interviewer, and every
-number here is something you can defend live if asked "walk me through that."
-
-- **Found and fixed a Redis connection-pool bug** via concurrency stress
-  testing (50,000 concurrent requests on one key) that was silently opening
-  one new TCP connection per in-flight request under load — degrading
-  throughput 3x. Fixed with a bounded `BlockingConnectionPool`, measured
-  5.5k → 16k checks/sec after.
-- **Proved rate-limit correctness under real contention, not sequential
-  calls**: verified the exact limit holds at 100x oversubscription
-  (50,000 concurrent requests) and across 1,000 simultaneous clients
-  (20,000 concurrent requests) with zero cross-client leakage, using
-  `asyncio.gather` to force true concurrency in the test itself.
-- **Diagnosed a load-test bottleneck with `docker stats`, not guesswork**:
-  at 1,000 concurrent users, found the gateway containers CPU-saturated
-  (106% each) and Postgres at 78% from synchronous audit-log writes — while
-  Redis, the actual rate limiter, sat at 10%. Correctly isolated the
-  bottleneck to the app tier, not the rate-limiting logic.
-- Built a distributed rate limiter + API gateway (FastAPI, Redis, Postgres)
-  implementing Token Bucket, Sliding Window Log, and Sliding Window Counter
-  as atomic Redis Lua scripts; 30-test suite with zero mocks, reproduced
-  flake-free across 5+ runs, wired into GitHub Actions CI.
-
-### Full list (swap any of the above for these if more relevant)
-
-- Built a distributed rate limiter and API gateway in FastAPI, implementing
-  Token Bucket, Sliding Window Log, and Sliding Window Counter algorithms
-  as atomic Redis Lua scripts to prevent race conditions across horizontally
-  scaled gateway instances.
-- Wrote a 30-test suite (unit, end-to-end, and concurrency/stress) covering
-  the algorithms, the ASGI app, and config caching, run against real Redis
-  and Postgres with zero mocks; reproduced flake-free across 5+ consecutive
-  full-suite runs (30/30 every time) and wired into a GitHub Actions CI
-  pipeline.
-- Proved race-freedom under real contention at scale, not just sequential
-  calls or small batches: verified the exact limit held at up to 100x
-  oversubscription and 50,000 concurrent requests on a single key, and that
-  1,000 simultaneous clients (20,000 concurrent requests total) stayed
-  perfectly isolated from each other with zero cross-client leakage —
-  sustaining ~15,000 rate-limit checks/sec throughout.
-- Debugged and fixed two concurrency bugs the stress tests surfaced: a
-  stale-limiter-cache issue where a cached Lua-script wrapper stayed bound to
-  a dead Redis client after a reconnect, and an unbounded connection pool
-  that opened one new TCP connection per concurrent request under load
-  (fixing it also made throughput ~3x faster: 5.5k → 16k checks/sec).
-- Simulated a 3-instance gateway cluster behind an nginx load balancer with
-  Docker Compose; verified via Locust that a single client's request count
-  stayed correctly enforced while requests round-robined across all 3
-  instances, proving limits are shared via Redis rather than tracked
-  per-instance.
-- Load-tested the gateway with Locust up to 1,000 concurrent users; at 500
-  users sustained ~500 req/s with p50 3ms / p99 170ms and 0% false-throttle
-  rate, and at 1,000 users diagnosed the actual bottleneck using `docker
-  stats` rather than just reporting a number — found the gateway containers
-  CPU-saturated (106% each, single uvicorn worker) and Postgres at 78% CPU
-  from synchronous audit-log writes, while Redis (the rate limiter itself)
-  sat at just 10%, correctly isolating the bottleneck to the app tier and
-  audit logging rather than the rate-limiting logic.
-- Verified the rejection path is cheap under a dedicated burst profile: 300
-  over-limit clients sustained 1,509 req/s of correctly-rejected 429s with
-  `Retry-After` headers — higher throughput than the accept path, since a
-  429 skips the upstream call entirely.
-- Versioned the Postgres schema with Alembic migrations run through a
-  dedicated one-shot init container, avoiding the race condition of 3
-  concurrently-starting gateway replicas each trying to create the same
-  tables.
-- Instrumented the gateway with Prometheus metrics and a Grafana dashboard
-  (request rate, denial rate, and per-algorithm latency), and persisted a
-  Postgres-backed audit log of rate-limit violations for debugging and
-  per-client configuration.

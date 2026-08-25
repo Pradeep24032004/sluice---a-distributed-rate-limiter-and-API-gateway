@@ -1,4 +1,4 @@
-.PHONY: up down logs test load-test
+.PHONY: up down logs test load-test benchmark
 
 up:
 	docker compose up -d --build
@@ -14,3 +14,6 @@ test:
 
 load-test:
 	locust -f load_test/locustfile.py --host http://localhost:8080
+
+benchmark:
+	PYTHONPATH=. python scripts/benchmark_scaling.py
