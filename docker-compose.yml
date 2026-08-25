@@ -1,0 +1,106 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  upstream:
+    build: ./upstream
+    ports:
+      - "9000:9000"
+
+  migrate:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+    command: ["alembic", "upgrade", "head"]
+
+  gateway1: &gateway
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    environment: &gateway-env
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+      UPSTREAM_URL: http://upstream:9000
+      INSTANCE_ID: gateway-1
+    expose:
+      - "8000"
+
+  gateway2:
+    <<: *gateway
+    environment:
+      <<: *gateway-env
+      INSTANCE_ID: gateway-2
+
+  gateway3:
+    <<: *gateway
+    environment:
+      <<: *gateway-env
+      INSTANCE_ID: gateway-3
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - gateway1
+      - gateway2
+      - gateway3
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:

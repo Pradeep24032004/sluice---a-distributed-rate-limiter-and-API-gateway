@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      - targets:
+          - gateway1:8000
+          - gateway2:8000
+          - gateway3:8000
+        labels:
+          service: rate-limiter-gateway

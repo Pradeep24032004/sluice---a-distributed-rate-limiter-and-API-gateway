@@ -1,0 +1,57 @@
+{
+  "title": "Rate Limiter Gateway",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate by instance",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_requests_total[1m])) by (instance_id)",
+          "legendFormat": "{{instance_id}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Rate-limit denied rate by algorithm",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(rate_limit_denied_total[1m])) by (algorithm)",
+          "legendFormat": "{{algorithm}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Upstream latency p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(gateway_upstream_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Rate-limit check latency p99 by algorithm",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(rate_limit_check_duration_seconds_bucket[1m])) by (le, algorithm))",
+          "legendFormat": "{{algorithm}}"
+        }
+      ]
+    }
+  ]
+}
